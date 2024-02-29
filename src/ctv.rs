@@ -139,4 +139,13 @@ impl Output {
             }
         })
     }
+
+    /// Extract amount of final output.
+    pub fn amount(&self) -> Amount {
+        match self {
+            Output::Address { address: _, amount } => *amount,
+            Output::Data { data: _ } => Amount::ZERO,
+            Output::Tree { tree: _, amount } => *amount,
+        }
+    }
 }
