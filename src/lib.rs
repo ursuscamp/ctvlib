@@ -1,9 +1,11 @@
 mod ctv;
 mod error;
-/// Utility functions for generating segwit addresses and scripts.
-pub mod segwit;
+
 mod tmplhash;
 
-pub use ctv::{Ctv, Output};
+/// Useful utility functions.
+pub mod util;
+
+pub use ctv::{Context, Fields, Output, TxType};
 pub use error::Error;
 pub use tmplhash::TemplateHash;

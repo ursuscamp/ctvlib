@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 bitcoin = { version = "0.31.1", features = ["serde"] }
+secp256k1 = { version = "0.28.2", features = ["rand", "hashes", "serde", "global-context"] }
 serde = { version = "1.0.197", features = ["derive"] }
 sha2 = "0.10.8"
 thiserror = "1.0.57"

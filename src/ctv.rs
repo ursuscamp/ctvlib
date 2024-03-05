@@ -1,51 +1,56 @@
 use bitcoin::{
-    absolute::LockTime, address::NetworkUnchecked, script::PushBytesBuf, transaction::Version,
+    absolute::LockTime,
+    address::{NetworkChecked, NetworkUnchecked},
+    opcodes::all::OP_NOP4,
+    script::PushBytesBuf,
+    taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
+    transaction::Version,
     Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Witness,
+    Witness, XOnlyPublicKey,
 };
 
+use secp256k1::SECP256K1;
 use serde::{Deserialize, Serialize};
 
-use crate::{segwit, Error, TemplateHash};
+use crate::{Error, TemplateHash};
 
-/// The main type that handles CTV hashing.
-///
-/// A couple of things to note here:
-/// - `network` is not committed to by CTV but is necessary for generating correct locking
-/// addresses.
-/// - CTV commits to the input count, but that is implied by the `sequences` item here.
-/// - `outputs` are not `TxOut` in this case, but a new data structure here.
+/// The main interface type for working with CTV.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ctv {
+pub struct Context {
     pub network: Network,
-    pub version: Version,
-    pub locktime: LockTime,
-    pub sequences: Vec<Sequence>,
-    pub outputs: Vec<Output>,
-    pub input_idx: u32,
+
+    /// Dictates whether CTV lock will a P2WSH or P2TR spend.
+    pub tx_type: TxType,
+
+    /// The fields that a CTV hash commits to.
+    pub fields: Fields,
 }
 
-impl Ctv {
-    fn as_tx(&self) -> Result<Transaction, Error> {
-        let input = self
-            .sequences
-            .iter()
-            .map(|seq| TxIn {
-                sequence: *seq,
-                ..Default::default()
-            })
-            .collect();
-        let output: Result<Vec<TxOut>, Error> = self
-            .outputs
-            .iter()
-            .map(|output| output.as_txout(self.network))
-            .collect();
-        Ok(Transaction {
-            version: self.version,
-            lock_time: self.locktime,
-            input,
-            output: output?,
-        })
+impl Context {
+    pub fn locking_script(&self) -> Result<ScriptBuf, Error> {
+        let tmplhash = self.ctv()?;
+        let mut pbf = PushBytesBuf::new();
+        pbf.extend_from_slice(&tmplhash)?;
+        Ok(bitcoin::script::Builder::new()
+            .push_slice(pbf)
+            .push_opcode(OP_NOP4)
+            .into_script())
+    }
+
+    pub fn address(&self) -> Result<Address<NetworkChecked>, Error> {
+        let locking_script = self.locking_script()?;
+        match self.tx_type {
+            TxType::Segwit => Ok(Address::p2wsh(&locking_script, self.network)),
+            TxType::Taproot { internal_key } => {
+                let tsi = self.taproot_spend_info(internal_key)?;
+                Ok(Address::p2tr(
+                    SECP256K1,
+                    internal_key,
+                    tsi.merkle_root(),
+                    self.network,
+                ))
+            }
+        }
     }
 
     /// Generate a spending transaction (or series of them) to spend the outputs of the CTV.
@@ -57,42 +62,98 @@ impl Ctv {
     pub fn spending_tx(&self, txid: Txid, vout: u32) -> Result<Vec<Transaction>, Error> {
         let mut transactions = Vec::new();
         let tx = Transaction {
-            version: self.version,
-            lock_time: self.locktime,
+            version: self.fields.version,
+            lock_time: self.fields.locktime,
             input: vec![TxIn {
                 previous_output: OutPoint { txid, vout },
                 script_sig: Default::default(),
-                sequence: *self.sequences.first().ok_or(Error::MissingSequence)?,
+                sequence: *self
+                    .fields
+                    .sequences
+                    .first()
+                    .ok_or(Error::MissingSequence)?,
                 witness: self.witness()?,
             }],
             output: self.txouts()?,
         };
         let current_txid = tx.txid();
         transactions.push(tx);
-        if let Some(Output::Tree { tree, amount: _ }) = self.outputs.first() {
+        if let Some(Output::Tree { tree, amount: _ }) = self.fields.outputs.first() {
             transactions.extend_from_slice(&tree.spending_tx(current_txid, 0)?);
         }
         Ok(transactions)
     }
 
+    /// The actual hash that this CTV represents. May be used in locking scripts.
+    pub fn ctv(&self) -> Result<Vec<u8>, Error> {
+        self.as_tx()?.template_hash(self.fields.input_idx)
+    }
+
+    fn taproot_spend_info(&self, internal_key: XOnlyPublicKey) -> Result<TaprootSpendInfo, Error> {
+        TaprootBuilder::new()
+            .add_leaf(0, self.locking_script()?)?
+            .finalize(SECP256K1, internal_key)
+            .map_err(|_| Error::UnknownError("Taproot not finalizable".into()))
+    }
+
+    fn as_tx(&self) -> Result<Transaction, Error> {
+        let input = self
+            .fields
+            .sequences
+            .iter()
+            .map(|seq| TxIn {
+                sequence: *seq,
+                ..Default::default()
+            })
+            .collect();
+        let output: Result<Vec<TxOut>, Error> = self
+            .fields
+            .outputs
+            .iter()
+            .map(|output| output.as_txout(self.network))
+            .collect();
+        Ok(Transaction {
+            version: self.fields.version,
+            lock_time: self.fields.locktime,
+            input,
+            output: output?,
+        })
+    }
+
     fn txouts(&self) -> Result<Vec<TxOut>, Error> {
-        self.outputs
+        self.fields
+            .outputs
             .iter()
             .map(|output| output.as_txout(self.network))
             .collect()
     }
 
-    /// The actual hash that this CTV represents. May be used in locking scripts.
-    pub fn ctv(&self) -> Result<Vec<u8>, Error> {
-        self.as_tx()?.template_hash(self.input_idx)
-    }
-
     fn witness(&self) -> Result<Witness, Error> {
         let mut witness = Witness::new();
-        let script = segwit::locking_script(&self.ctv()?);
-        witness.push(&script);
+        let script = self.locking_script()?;
+        witness.push(script.clone());
+        match self.tx_type {
+            TxType::Segwit => {}
+            TxType::Taproot { internal_key } => {
+                let tsi = self.taproot_spend_info(internal_key)?;
+                let cb = tsi
+                    .control_block(&(script, LeafVersion::TapScript))
+                    .ok_or_else(|| Error::UnknownError("Taproot construction error".into()))?;
+                witness.push(cb.serialize());
+            }
+        }
         Ok(witness)
     }
+}
+
+/// The fields to which a CTV hash commits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fields {
+    pub version: Version,
+    pub locktime: LockTime,
+    pub sequences: Vec<Sequence>,
+    pub outputs: Vec<Output>,
+    pub input_idx: u32,
 }
 
 /// Outputs committed to by a `Ctv`.
@@ -110,7 +171,7 @@ pub enum Output {
 
     /// Commit an `amount` to a nested `Ctv` output. Use this to create a congestion control tree
     /// or another type of covenant tree.
-    Tree { tree: Box<Ctv>, amount: Amount },
+    Tree { tree: Box<Context>, amount: Amount },
 }
 
 impl Output {
@@ -129,14 +190,10 @@ impl Output {
                     script_pubkey: ScriptBuf::new_op_return(&pb),
                 }
             }
-            Output::Tree { tree, amount } => {
-                let tmplhash = tree.ctv()?;
-                let locking_script = segwit::locking_script(&tmplhash);
-                TxOut {
-                    value: *amount,
-                    script_pubkey: Address::p2wsh(&locking_script, network).script_pubkey(),
-                }
-            }
+            Output::Tree { tree, amount } => TxOut {
+                value: *amount,
+                script_pubkey: tree.address()?.script_pubkey(),
+            },
         })
     }
 
@@ -148,4 +205,13 @@ impl Output {
             Output::Tree { tree: _, amount } => *amount,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub enum TxType {
+    #[default]
+    Segwit,
+    Taproot {
+        internal_key: XOnlyPublicKey,
+    },
 }
